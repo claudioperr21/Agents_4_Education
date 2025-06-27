@@ -1,3 +1,28 @@
+# agent_sdk.py
+from typing import Dict, Any
+import logging
+
+class AgentHandoff:
+    def __init__(self, name: str):
+        self.name = name
+        self.log = []
+
+    def send(self, payload: Dict[str, Any], recipient: str) -> Dict[str, Any]:
+        log_entry = {
+            "from": self.name,
+            "to": recipient,
+            "payload": payload
+        }
+        logging.info(f"Handoff from {self.name} to {recipient}")
+        self.log.append(log_entry)
+        return payload
+
+    def receive(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        logging.info(f"{self.name} received payload")
+        return payload
+
+
+# main.py
 from typing import List, Dict, Any
 import os
 import time
@@ -9,6 +34,10 @@ from pathlib import Path
 from openai import OpenAIError, RateLimitError, APIConnectionError, Timeout
 from dotenv import load_dotenv
 import openai
+import logging
+from agent_sdk import AgentHandoff
+
+logging.basicConfig(level=logging.INFO)
 
 # Load environment variables from .env (if present)
 load_dotenv()
@@ -53,7 +82,8 @@ Return valid JSON EXACTLY in this format (no extra keys):
   "Market": <1–10>,
   "Solution": <1–10>,
   "Delivery": <1–10>,
-  "Feedback": "<one sentence actionable feedback for each anchor>"
+  "Feedback": "<one sentence actionable feedback for each anchor>",
+  "Justification": <one sentence justifying the score for each anchor>
 }
 """
 
@@ -132,8 +162,6 @@ Respond ONLY with raw JSON (no markdown):
   "total_score": Z
 }
 """
-
-# ========== UTILITIES ==========
 def extract_pdf_to_markdown(pdf_path: str) -> str:
     def clean_text_formatting(text: str) -> str:
         lines = text.split("\n")
@@ -168,7 +196,6 @@ def extract_pdf_to_markdown(pdf_path: str) -> str:
 
 
 def transcribe(mp3_path: str) -> str:
-    """Return transcript from Whisper with simple caching logic."""
     cache_file = os.path.join(RUBRIC_CACHE_DIR, os.path.basename(mp3_path) + ".txt")
     if os.path.exists(cache_file):
         return open(cache_file, "r").read()
@@ -186,22 +213,27 @@ def transcribe(mp3_path: str) -> str:
 
 
 def analyze_audio(mp3_path: str) -> Dict[str, Any]:
+    handoff = AgentHandoff(name="TranscriptionAgent")
+
+    transcript = transcribe(mp3_path)
+    transcription_payload = handoff.send({"transcript": transcript}, recipient="AudioAnalysisAgent")
+
     y, sr = librosa.load(mp3_path, sr=16000, mono=True)
     duration = len(y) / sr
-    transcript = transcribe(mp3_path)
     word_count = len(transcript.split())
     wpm = word_count / (duration / 60) if duration else 0
     intervals = librosa.effects.split(y, top_db=30)
     voiced = sum((e - s) for s, e in intervals) / sr
     silence_ratio = (duration - voiced) / duration if duration else 0
+
     return {
         "duration": duration,
         "wpm": wpm,
         "silence_ratio": silence_ratio,
-        "transcript": transcript
+        "transcript": transcription_payload["transcript"]
     }
 
-# ========== GRADERS ==========
+
 def call_with_backoff(**kwargs):
     backoff = INITIAL_BACKOFF
     for attempt in range(1, MAX_RETRIES + 1):
@@ -212,14 +244,23 @@ def call_with_backoff(**kwargs):
                 raise
             time.sleep(backoff * (2 ** (attempt - 1)))
 
+
 def grade_exam(rubric: str, questions: str, responses: str, exam_type: str = "narrative") -> dict:
+    handoff = AgentHandoff(name="PreprocessingAgent")
+
+    input_payload = handoff.send({
+        "rubric": rubric,
+        "questions": questions,
+        "responses": responses,
+        "exam_type": exam_type
+    }, recipient="GradingAgent")
+
     rubric_markdown = rubric.strip() or "No rubric provided."
 
     if exam_type == "technical":
         user_prompt = TECHNICAL_PROMPT_TEMPLATE.format(rubric_markdown=rubric_markdown) + f"\n\nQuestions:\n{questions}\n\nStudent Responses:\n{responses}"
         system_prompt = "You are a helpful technical exam grader."
-
-    else:  # narrative default
+    else:
         if rubric.strip():
             system_prompt = NARRATIVE_PROMPT_WITH_RUBRIC
             user_prompt = f"Rubric:\n{rubric}\n\nQuestions:\n{questions}\n\nStudent Responses:\n{responses}"
