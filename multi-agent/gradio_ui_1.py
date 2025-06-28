@@ -1,12 +1,15 @@
 import gradio as gr
 import os
 import json
-from exam_grader_agents_multi_1 import extract_pdf_to_markdown, analyze_audio, grade_exam
+import asyncio
+from exam_grader_agents_multi_1 import extract_pdf_to_markdown, analyze_audio, grade_input
 from dotenv import load_dotenv
 from fpdf import FPDF
 import openai
+from agents import set_tracing_export_api_key
 
 load_dotenv()
+set_tracing_export_api_key(os.getenv("OPENAI_API_KEY"))
 
 # Utility function to extract text from various file formats
 def extract_text_from_file(file_obj):
@@ -33,7 +36,14 @@ def handle_exam(pdf_path, rubric_path, student_response_file, exam_type):
     rubric_md = extract_pdf_to_markdown(rubric_path.name) if rubric_path else ""
     student_response_md = extract_text_from_file(student_response_file)
 
-    result = grade_exam(rubric_md, questions_md, student_response_md, exam_type=exam_type)
+    input_payload = {
+        "questions": questions_md,
+        "rubric": rubric_md,
+        "responses": student_response_md,
+        "exam_type": exam_type
+    }
+
+    result = asyncio.run(grade_input(input_payload))
 
     # Save results to JSON and PDF
     base_name = f"{exam_type}_grade_output"
@@ -48,79 +58,25 @@ def handle_exam(pdf_path, rubric_path, student_response_file, exam_type):
 
 def handle_vc_pitch(audio_file):
     audio_metrics = analyze_audio(audio_file)
-    transcript = audio_metrics["transcript"]
-    duration_minutes = audio_metrics["duration"] / 60
+    input_payload = {
+        "duration": audio_metrics["duration"],
+        "wpm": audio_metrics["wpm"],
+        "silence_ratio": audio_metrics["silence_ratio"],
+        "transcript": audio_metrics["transcript"],
+        "exam_type": "vc_pitch"
+    }
 
-    prompt = f"""
-Pitch transcript:
-{transcript}
+    result = asyncio.run(grade_input(input_payload))
 
-Audio metrics:
-• Words-per-minute: {audio_metrics['wpm']:.1f}
-• Pause ratio: {audio_metrics['silence_ratio']:.1%}
+    base_name = "vc_pitch_grade_output"
+    json_path = base_name + ".json"
+    pdf_path = base_name + ".pdf"
 
-You are a seasoned VC pitch grader. For a {duration_minutes:.1f}-minute audio pitch, give each dimension a score from 1 (poor) to 10 (excellent), using the following anchors:
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    json_to_pdf(result, pdf_path)
 
-1. Problem Clarity  
-   • 1–3: No clear problem stated, listener confused  
-   • 4–6: Problem mentioned but lacks context or urgency  
-   • 7–8: Problem clearly described with context  
-   • 9–10: Problem statement is crisp, impactful, and immediately compelling
-
-2. Market Evidence  
-   • 1–3: No market data or vague claims  
-   • 4–6: Qualitative market description, no numbers  
-   • 7–8: One clear quantitative metric (TAM, growth rate)  
-   • 9–10: Multiple strong data points (TAM, traction, growth) cited
-
-3. Solution Differentiation  
-   • 1–3: Solution not differentiated, generic  
-   • 4–6: Mentions a unique feature but no defense  
-   • 7–8: Clearly highlights one defensible advantage  
-   • 9–10: Demonstrates multiple, well-justified differentiators or proprietary edge
-
-4. Delivery & Pacing  
-   • 1–3: Monotone or too fast/slow (outside 80–200 WPM), frequent long pauses (>30 %)  
-   • 4–6: Understandable but some pacing issues (WPM 90–210, pauses 20–30 %)  
-   • 7–8: Good pace (110–160 WPM), pauses <20 %  
-   • 9–10: Engaging tone, ideal pacing (120–150 WPM), minimal pauses (<10 %)
-
-Return valid JSON EXACTLY in this format (no extra keys):
-{{
-  "Problem": <1–10>,
-  "Market": <1–10>,
-  "Solution": <1–10>,
-  "Delivery": <1–10>,
-  "Feedback": "<one sentence actionable feedback for each anchor>"
-}}
-"""
-
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4-0613",
-            messages=[
-                {"role": "system", "content": "You are a helpful pitch grader."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0
-        )
-        result = response.choices[0].message.content
-
-        base_name = "vc_pitch_grade_output"
-        json_path = base_name + ".json"
-        pdf_path = base_name + ".pdf"
-
-        try:
-            json_result = json.loads(result)
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(json_result, f, indent=2, ensure_ascii=False)
-            json_to_pdf(json_result, pdf_path)
-            return result, json_path, pdf_path
-        except json.JSONDecodeError:
-            return result, None, None
-
-    except openai.OpenAIError as e:
-        return f"Error: {str(e)}", None, None
+    return json.dumps(result, indent=2, ensure_ascii=False), json_path, pdf_path
 
 # ========== INTERFACES ==========
 exam_tab = gr.Interface(

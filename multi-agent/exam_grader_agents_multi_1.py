@@ -1,28 +1,3 @@
-# agent_sdk.py
-from typing import Dict, Any
-import logging
-
-class AgentHandoff:
-    def __init__(self, name: str):
-        self.name = name
-        self.log = []
-
-    def send(self, payload: Dict[str, Any], recipient: str) -> Dict[str, Any]:
-        log_entry = {
-            "from": self.name,
-            "to": recipient,
-            "payload": payload
-        }
-        logging.info(f"Handoff from {self.name} to {recipient}")
-        self.log.append(log_entry)
-        return payload
-
-    def receive(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        logging.info(f"{self.name} received payload")
-        return payload
-
-
-# main.py
 from typing import List, Dict, Any
 import os
 import time
@@ -34,10 +9,8 @@ from pathlib import Path
 from openai import OpenAIError, RateLimitError, APIConnectionError, Timeout
 from dotenv import load_dotenv
 import openai
-import logging
-from agent_sdk import AgentHandoff
-
-logging.basicConfig(level=logging.INFO)
+from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel
+import asyncio
 
 # Load environment variables from .env (if present)
 load_dotenv()
@@ -48,120 +21,138 @@ INITIAL_BACKOFF = 2.0
 RUBRIC_CACHE_DIR = os.path.join(os.getcwd(), "cache")
 os.makedirs(RUBRIC_CACHE_DIR, exist_ok=True)
 
-# Grading rubric for VC pitch
-RUBRIC_VC = """
-You are a seasoned VC pitch grader. For a {{duration}}-minute audio pitch, give each dimension a score from 1 (poor) to 10 (excellent), using the following anchors:
+# ========== AGENTS ==========
+vc_pitch_agent = Agent(
+    name="VC Pitch Agent",
+    instructions=(
+        "You are a seasoned VC pitch grader. For a {{duration}}-minute audio pitch, give each dimension a score from 1 (poor) to 10 (excellent), using the following anchors:\n"
+        "\n1. Problem Clarity\n"
+        "   • 1–3: No clear problem stated, listener confused\n"
+        "   • 4–6: Problem mentioned but lacks context or urgency\n"
+        "   • 7–8: Problem clearly described with context\n"
+        "   • 9–10: Problem statement is crisp, impactful, and immediately compelling\n"
+        "\n2. Market Evidence\n"
+        "   • 1–3: No market data or vague claims\n"
+        "   • 4–6: Qualitative market description, no numbers\n"
+        "   • 7–8: One clear quantitative metric (TAM, growth rate)\n"
+        "   • 9–10: Multiple strong data points (TAM, traction, growth) cited\n"
+        "\n3. Solution Differentiation\n"
+        "   • 1–3: Solution not differentiated, generic\n"
+        "   • 4–6: Mentions a unique feature but no defense\n"
+        "   • 7–8: Clearly highlights one defensible advantage\n"
+        "   • 9–10: Demonstrates multiple, well-justified differentiators or proprietary edge\n"
+        "\n4. Delivery & Pacing\n"
+        "   • 1–3: Monotone or too fast/slow (outside 80–200 WPM), frequent long pauses (>30 %)\n"
+        "   • 4–6: Understandable but some pacing issues (WPM 90–210, pauses 20–30 %)\n"
+        "   • 7–8: Good pace (110–160 WPM), pauses <20 %\n"
+        "   • 9–10: Engaging tone, ideal pacing (120–150 WPM), minimal pauses (<10 %)\n"
+        "\nIf a rubric is provided, override this rubric with the one provided.\n"
+        "\nReturn valid JSON EXACTLY in this format (no extra keys):\n"
+        "{\n"
+        "  \"Problem\": <1–10>,\n"
+        "  \"Market\": <1–10>,\n"
+        "  \"Solution\": <1–10>,\n"
+        "  \"Delivery\": <1–10>,\n"
+        "  \"Feedback\": \"<one sentence actionable feedback for each anchor>\",\n"
+        "  \"total_score\": <1–10>,\n"
+        "  \"overall_feedback\": \"<one paragraph summary of performance>\",\n"
+        "  \"overall_justification\": \"<one paragraph justification for the overall grade>\"\n"
+        "}\n"
+        "\n### Rubric (if available):\n{rubric_markdown}"
+    ),
+    model=OpenAIChatCompletionsModel(
+        model="gpt-4",
+        openai_client=AsyncOpenAI()
+    )
+)
 
-1. Problem Clarity  
-   • 1–3: No clear problem stated, listener confused  
-   • 4–6: Problem mentioned but lacks context or urgency  
-   • 7–8: Problem clearly described with context  
-   • 9–10: Problem statement is crisp, impactful, and immediately compelling
+technical_exam_agent = Agent(
+    name="Technical Exam Agent",
+    instructions=(
+        "You are a grading assistant for technical exams. Evaluate student responses based on the provided questions and, if available, the rubric.\n"
+        "- For each question:\n"
+        "  - Read the question and the student's answer.\n"
+        "  - If a rubric is provided, follow it carefully to assign points.\n"
+        "  - If no rubric is provided, use your expert-level knowledge to assess factual accuracy, completeness, and clarity.\n"
+        "- Assign a score for each answer using a 0-10 point scale.\n"
+        "- Provide feedback for each answer, including rationale and suggestions for improvement if needed.\n"
+        "\n### Output Format:\nRespond ONLY with raw JSON (no markdown):\n"
+        "{\n"
+        "  \"question_1\": {\n    \"score\": X,\n    \"feedback\": \"...\"\n  },\n"
+        "  \"question_2\": {\n    \"score\": Y,\n    \"feedback\": \"...\"\n  },\n"
+        "  ...\n"
+        "  \"total_score\": Z,\n"
+        "  \"overall_feedback\": \"<one paragraph summary of performance>\",\n"
+        "  \"overall_justification\": \"<one paragraph justification for the overall grade>\"\n"
+        "}\n"
+        "\n### Rubric (if available):\n{rubric_markdown}"
+    ),
+    model=OpenAIChatCompletionsModel(
+        model="gpt-4",
+        openai_client=AsyncOpenAI()
+    )
+)
 
-2. Market Evidence  
-   • 1–3: No market data or vague claims  
-   • 4–6: Qualitative market description, no numbers  
-   • 7–8: One clear quantitative metric (TAM, growth rate)  
-   • 9–10: Multiple strong data points (TAM, traction, growth) cited
+narrative_exam_agent = Agent(
+    name="Narrative Exam Agent",
+    instructions=(
+        "You are an exam grader. If a rubric is provided, use it to assign each question a numeric score (0-10) and give concise feedback.\n"
+        "If no rubric is available, use your own criteria. Then compute the overall score as the average and provide general feedback.\n"
+        "\nReturn JSON.\n"
+        "\n### Output Format:\nRespond ONLY with raw JSON (no markdown):\n"
+        "{\n"
+        "  \"question_1\": {\n    \"score\": X,\n    \"feedback\": \"...\"\n  },\n"
+        "  \"question_2\": {\n    \"score\": Y,\n    \"feedback\": \"...\"\n  },\n"
+        "  ...\n"
+        "  \"total_score\": Z,\n"
+        "  \"overall_feedback\": \"<one paragraph summary of performance>\",\n"
+        "  \"overall_justification\": \"<one paragraph justification for the overall grade>\"\n"
+        "}\n"
+        "\n### Rubric (if available):\n{rubric_markdown}"
+    ),
+    model=OpenAIChatCompletionsModel(
+        model="gpt-4",
+        openai_client=AsyncOpenAI()
+    )
+)
 
-3. Solution Differentiation  
-   • 1–3: Solution not differentiated, generic  
-   • 4–6: Mentions a unique feature but no defense  
-   • 7–8: Clearly highlights one defensible advantage  
-   • 9–10: Demonstrates multiple, well-justified differentiators or proprietary edge
+triage_agent = Agent(
+    name="Triage Agent",
+    instructions=(
+        "Route the input to the appropriate agent:\n"
+        "- If it's an audio file (e.g., mp3), send to the VC Pitch Agent.\n"
+        "- If it's a technical exam, send to the Technical Exam Agent.\n"
+        "- If it's a narrative-style written exam, send to the Narrative Exam Agent."
+    ),
+    handoffs=[vc_pitch_agent, technical_exam_agent, narrative_exam_agent],
+    model="gpt-4"
+)
 
-4. Delivery & Pacing  
-   • 1–3: Monotone or too fast/slow (outside 80–200 WPM), frequent long pauses (>30 %)  
-   • 4–6: Understandable but some pacing issues (WPM 90–210, pauses 20–30 %)  
-   • 7–8: Good pace (110–160 WPM), pauses <20 %  
-   • 9–10: Engaging tone, ideal pacing (120–150 WPM), minimal pauses (<10 %)
+async def grade_input(input_payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        # Convert dictionary to a string that the Triage Agent can understand
+        exam_type = input_payload.get("exam_type")
+        if exam_type == "vc_pitch":
+            input_str = (
+                f"Transcript: {input_payload['transcript']}\n"
+                f"Duration: {input_payload['duration']:.2f} seconds\n"
+                f"WPM: {input_payload['wpm']:.2f}\n"
+                f"Silence Ratio: {input_payload['silence_ratio']:.2%}"
+            )
+        else:
+            input_str = (
+                f"Exam Type: {exam_type}\n"
+                f"Questions:\n{input_payload['questions']}\n\n"
+                f"Rubric:\n{input_payload['rubric']}\n\n"
+                f"Student Responses:\n{input_payload['responses']}"
+            )
 
-Return valid JSON EXACTLY in this format (no extra keys):
-{
-  "Problem": <1–10>,
-  "Market": <1–10>,
-  "Solution": <1–10>,
-  "Delivery": <1–10>,
-  "Feedback": "<one sentence actionable feedback for each anchor>",
-  "Justification": <one sentence justifying the score for each anchor>
-}
-"""
+        result = await Runner.run(triage_agent, input=input_str)
+        return result.final_output
+    except Exception as e:
+        return {"error": str(e)}
 
-# Technical agent prompt
-TECHNICAL_PROMPT_TEMPLATE = """
-You are a grading assistant for technical exams. Your role is to evaluate student responses based on the provided questions and, if available, the rubric.
-
-### Grading Instructions:
-- For each question:
-  - Read the question and the student's answer.
-  - If a rubric is provided for that question, follow it carefully to assign points based on the expected criteria.
-  - If no rubric is provided, use your expert-level knowledge of the subject to assess:
-    - Factual accuracy.
-    - Completeness.
-    - Clarity.
-- Assign a score for each answer:
-  - Use the point scale from the rubric, or if none is provided, use a default scale of 0-10 points.
-- Provide feedback for each answer:
-  - Explain why the student received the score.
-  - Offer suggestions for improvement if the answer is incomplete or incorrect.
-
-### Output Format:
-Respond ONLY with raw JSON (no markdown):
-{
-  "question_1": {
-    "score": X,
-    "feedback": "..."
-  },
-  "question_2": {
-    "score": Y,
-    "feedback": "..."
-  },
-  ...
-  "total_score": Z
-}
-
-### Rubric (if available):
-{rubric_markdown}
-"""
-
-# Narrative agent prompt
-NARRATIVE_PROMPT_WITH_RUBRIC = """
-You are an exam grader. Use the rubric to assign each question a numeric score (0-10) and valuable concise feedback so the student can further understand their strengths and weaknesses of the material. Then compute the overall score as the average and provide general feedback. Return JSON.
-
-### Output Format:
-Respond ONLY with raw JSON (no markdown):
-{
-  "question_1": {
-    "score": X,
-    "feedback": "..."
-  },
-  "question_2": {
-    "score": Y,
-    "feedback": "..."
-  },
-  ...
-  "total_score": Z
-}
-"""
-
-NARRATIVE_PROMPT_NO_RUBRIC = """
-You are an exam grader. The rubric is not available. Use your own criteria to assign each question a numeric score (0-10) and constructive feedback. Then compute the overall score as the average and provide general feedback. Return JSON.
-
-### Output Format:
-Respond ONLY with raw JSON (no markdown):
-{
-  "question_1": {
-    "score": X,
-    "feedback": "..."
-  },
-  "question_2": {
-    "score": Y,
-    "feedback": "..."
-  },
-  ...
-  "total_score": Z
-}
-"""
+# ========== UTILITIES ==========
 def extract_pdf_to_markdown(pdf_path: str) -> str:
     def clean_text_formatting(text: str) -> str:
         lines = text.split("\n")
@@ -196,6 +187,7 @@ def extract_pdf_to_markdown(pdf_path: str) -> str:
 
 
 def transcribe(mp3_path: str) -> str:
+    """Return transcript from Whisper with simple caching logic."""
     cache_file = os.path.join(RUBRIC_CACHE_DIR, os.path.basename(mp3_path) + ".txt")
     if os.path.exists(cache_file):
         return open(cache_file, "r").read()
@@ -213,27 +205,22 @@ def transcribe(mp3_path: str) -> str:
 
 
 def analyze_audio(mp3_path: str) -> Dict[str, Any]:
-    handoff = AgentHandoff(name="TranscriptionAgent")
-
-    transcript = transcribe(mp3_path)
-    transcription_payload = handoff.send({"transcript": transcript}, recipient="AudioAnalysisAgent")
-
     y, sr = librosa.load(mp3_path, sr=16000, mono=True)
     duration = len(y) / sr
+    transcript = transcribe(mp3_path)
     word_count = len(transcript.split())
     wpm = word_count / (duration / 60) if duration else 0
     intervals = librosa.effects.split(y, top_db=30)
     voiced = sum((e - s) for s, e in intervals) / sr
     silence_ratio = (duration - voiced) / duration if duration else 0
-
     return {
         "duration": duration,
         "wpm": wpm,
         "silence_ratio": silence_ratio,
-        "transcript": transcription_payload["transcript"]
+        "transcript": transcript
     }
 
-
+# ========== GRADERS ==========
 def call_with_backoff(**kwargs):
     backoff = INITIAL_BACKOFF
     for attempt in range(1, MAX_RETRIES + 1):
@@ -244,23 +231,14 @@ def call_with_backoff(**kwargs):
                 raise
             time.sleep(backoff * (2 ** (attempt - 1)))
 
-
 def grade_exam(rubric: str, questions: str, responses: str, exam_type: str = "narrative") -> dict:
-    handoff = AgentHandoff(name="PreprocessingAgent")
-
-    input_payload = handoff.send({
-        "rubric": rubric,
-        "questions": questions,
-        "responses": responses,
-        "exam_type": exam_type
-    }, recipient="GradingAgent")
-
     rubric_markdown = rubric.strip() or "No rubric provided."
 
     if exam_type == "technical":
         user_prompt = TECHNICAL_PROMPT_TEMPLATE.format(rubric_markdown=rubric_markdown) + f"\n\nQuestions:\n{questions}\n\nStudent Responses:\n{responses}"
         system_prompt = "You are a helpful technical exam grader."
-    else:
+
+    else:  # narrative default
         if rubric.strip():
             system_prompt = NARRATIVE_PROMPT_WITH_RUBRIC
             user_prompt = f"Rubric:\n{rubric}\n\nQuestions:\n{questions}\n\nStudent Responses:\n{responses}"
